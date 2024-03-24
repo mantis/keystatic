@@ -4,7 +4,6 @@ import * as Y from 'yjs';
 import * as s from 'superstruct';
 
 import { Button } from '@keystar/ui/button';
-import { DialogContainer } from '@keystar/ui/dialog';
 import { Icon } from '@keystar/ui/icon';
 import { historyIcon } from '@keystar/ui/icon/icons/historyIcon';
 import { Flex } from '@keystar/ui/layout';
@@ -21,12 +20,18 @@ import { useEventCallback } from '../form/fields/document/DocumentEditor/ui-util
 import { createGetPreviewProps } from '../form/preview-props';
 import { createGetPreviewPropsFromY } from '../form/preview-props-yjs';
 import { getYjsValFromParsedValue } from '../form/props-value';
+import {
+  getCollectionFormat,
+  getCollectionItemPath,
+  getPathPrefix,
+  getSlugFromState,
+} from './utils';
 
-import { CreateBranchDuringUpdateDialog } from './ItemPage';
 import l10nMessages from './l10n/index.json';
-import { useBaseCommit, useBranchInfo } from './shell/data';
+import { useBranchInfo, useCurrentUnscopedTree } from './shell/data';
 import { PageRoot, PageHeader, PageBody } from './shell/page';
-import { ForkRepoDialog } from './fork-repo';
+import { useRouter } from './router';
+import { serializeEntryToFiles, useUpsertItem } from './updating';
 import { FormForEntry, containerWidthForEntryLayout } from './entry-form';
 import { notFound } from './not-found';
 import {
@@ -36,22 +41,15 @@ import {
   showDraftRestoredToast,
 } from './persistence';
 import { PresenceAvatars } from './presence';
-import { useRouter } from './router';
 import { HeaderBreadcrumbs } from './shell/HeaderBreadcrumbs';
 import { useYjs, useYjsIfAvailable } from './shell/collab';
 import { useConfig } from './shell/context';
 import { useSlugFieldInfo } from './slugs';
 import { LOADING, useData } from './useData';
-import { serializeEntryToFiles, useUpsertItem } from './updating';
 import { parseEntry, useItemData } from './useItemData';
 import { useHasChanged } from './useHasChanged';
 import { useYJsValue } from './useYJsValue';
-import {
-  getCollectionFormat,
-  getCollectionItemPath,
-  getSlugFromState,
-  isGitHubConfig,
-} from './utils';
+import { useExtraRoots, writeChangesToLocalObjectStore } from './object-store';
 
 function CreateItemWrapper(props: {
   collection: string;
@@ -314,17 +312,35 @@ function CreateItemLocal(props: {
   const formatInfo = getCollectionFormat(props.config, props.collection);
 
   const basePath = getCollectionItemPath(props.config, props.collection, slug);
-  const [createResult, _createItem, resetCreateItemState] = useUpsertItem({
-    state,
-    basePath,
-    initialFiles: undefined,
-    config: props.config,
-    schema: collectionConfig.schema,
-    format: formatInfo,
-    currentLocalTreeKey: undefined,
-    slug: { field: collectionConfig.slugField, value: slug },
+
+  const [isCreating, setIsCreating] = useState(false);
+
+  const branchInfo = useBranchInfo();
+  const extraRoots = useExtraRoots();
+  const unscopedTree = useCurrentUnscopedTree();
+
+  const createItem = useEventCallback(async () => {
+    if (isCreating || unscopedTree.kind !== 'loaded') return false;
+    setIsCreating(true);
+    const pathPrefix = getPathPrefix(props.config.storage) || '';
+    const additions = serializeEntryToFiles({
+      basePath,
+      config: props.config,
+      format: formatInfo,
+      schema: collectionConfig.schema,
+      slug: { field: collectionConfig.slugField, value: slug },
+      state,
+    }).map(({ path, contents }) => ({ path: pathPrefix + path, contents }));
+
+    await writeChangesToLocalObjectStore({
+      additions,
+      currentBranch: branchInfo.currentBranch,
+      extraRoots,
+      initialFiles: [],
+      unscopedTree: unscopedTree.data.tree,
+    });
+    return true;
   });
-  const createItem = useEventCallback(_createItem);
 
   const hasChanged = useHasChanged({
     initialState,
@@ -332,8 +348,6 @@ function CreateItemLocal(props: {
     state,
     slugField: collectionConfig.slugField,
   });
-  const hasCreated =
-    createResult.kind === 'updated' || createResult.kind === 'loading';
 
   useEffect(() => {
     const key = [
@@ -343,7 +357,7 @@ function CreateItemLocal(props: {
         ? ([props.duplicateSlug] as const)
         : ([] as const)),
     ] as const;
-    if (hasChanged && !hasCreated) {
+    if (hasChanged && !isCreating) {
       const serialized = serializeEntryToFiles({
         basePath,
         config: props.config,
@@ -373,15 +387,14 @@ function CreateItemLocal(props: {
     props.config,
     basePath,
     formatInfo,
-    hasCreated,
+    isCreating,
   ]);
   return (
     <CreateItemInner
       basePath={props.basePath}
+      isCreating={isCreating}
       collection={props.collection}
-      createResult={createResult}
       createItem={createItem}
-      resetCreateItemState={resetCreateItemState}
       state={state}
       slug={slug}
       previewProps={previewProps}
@@ -419,7 +432,7 @@ function CreateItemCollab(props: {
   const formatInfo = getCollectionFormat(props.config, props.collection);
 
   const basePath = getCollectionItemPath(props.config, props.collection, slug);
-  const [createResult, _createItem, resetCreateItemState] = useUpsertItem({
+  const [createResult, _createItem] = useUpsertItem({
     state,
     basePath,
     initialFiles: undefined,
@@ -435,9 +448,10 @@ function CreateItemCollab(props: {
     <CreateItemInner
       basePath={props.basePath}
       collection={props.collection}
-      createResult={createResult}
+      isCreating={
+        createResult.kind === 'loading' || createResult.kind === 'updated'
+      }
       createItem={createItem}
-      resetCreateItemState={resetCreateItemState}
       state={state}
       slug={slug}
       previewProps={previewProps}
@@ -459,9 +473,8 @@ function CreateItemCollab(props: {
 function CreateItemInner(props: {
   basePath: string;
   collection: string;
-  createResult: ReturnType<typeof useUpsertItem>[0];
+  isCreating: boolean;
   createItem: ReturnType<typeof useUpsertItem>[1];
-  resetCreateItemState: ReturnType<typeof useUpsertItem>[2];
   state: Record<string, unknown>;
   slug: string;
   previewProps: ReturnType<typeof createGetPreviewPropsFromY>;
@@ -480,22 +493,15 @@ function CreateItemInner(props: {
   const [forceValidation, setForceValidation] = useState(false);
   const formatInfo = getCollectionFormat(config, props.collection);
 
-  const baseCommit = useBaseCommit();
-
   let collectionPath = `${props.basePath}/collection/${encodeURIComponent(
     props.collection
   )}`;
 
-  const { createResult } = props;
-
-  const currentSlug =
-    createResult.kind === 'updated' || createResult.kind === 'loading'
-      ? props.slug
-      : undefined;
+  const currentSlug = props.isCreating ? props.slug : undefined;
   const slugInfo = useSlugFieldInfo(props.collection, currentSlug);
 
   const onCreate = async () => {
-    if (createResult.kind === 'loading') return;
+    if (props.isCreating) return;
     if (!clientSideValidateProp(schema, props.state, slugInfo)) {
       setForceValidation(true);
       return;
@@ -506,11 +512,6 @@ function CreateItemInner(props: {
       toastQueue.positive('Entry created', { timeout: 5000 }); // TODO: l10n
     }
   };
-
-  // note we're still "loading" when it's already been created
-  // since we're waiting to go to the item page
-  const isLoading =
-    createResult.kind === 'loading' || createResult.kind === 'updated';
 
   const formID = 'item-create-form';
   const breadcrumbItems = useMemo(
@@ -531,7 +532,7 @@ function CreateItemInner(props: {
         <PageHeader>
           <HeaderBreadcrumbs items={breadcrumbItems} />
           <PresenceAvatars />
-          {isLoading && (
+          {props.isCreating && (
             <ProgressCircle
               aria-label="Creating entry"
               isIndeterminate
@@ -552,7 +553,7 @@ function CreateItemInner(props: {
             <Tooltip>Reset</Tooltip>
           </TooltipTrigger>
           <Button
-            isDisabled={isLoading}
+            isDisabled={props.isCreating}
             prominence="high"
             type="submit"
             form={formID}
@@ -575,9 +576,6 @@ function CreateItemInner(props: {
           minHeight={0}
           minWidth={0}
         >
-          {createResult.kind === 'error' && (
-            <Notice tone="critical">{createResult.error.message}</Notice>
-          )}
           <FormForEntry
             previewProps={props.previewProps}
             forceValidation={forceValidation}
@@ -587,64 +585,6 @@ function CreateItemInner(props: {
           />
         </Flex>
       </PageRoot>
-
-      <DialogContainer
-        // ideally this would be a popover on desktop but using a DialogTrigger
-        // wouldn't work since this doesn't open on click but after doing a
-        // network request and it failing and manually wiring about a popover
-        // and modal would be a pain
-        onDismiss={props.resetCreateItemState}
-      >
-        {createResult.kind === 'needs-new-branch' && (
-          <CreateBranchDuringUpdateDialog
-            branchOid={baseCommit}
-            onCreate={async newBranch => {
-              router.push(
-                `/keystatic/branch/${encodeURIComponent(
-                  newBranch
-                )}/collection/${encodeURIComponent(props.collection)}/create`
-              );
-              if (
-                await props.createItem({ branch: newBranch, sha: baseCommit })
-              ) {
-                const slug = getSlugFromState(collectionConfig, props.state);
-
-                router.push(
-                  `/keystatic/branch/${encodeURIComponent(
-                    newBranch
-                  )}/collection/${encodeURIComponent(
-                    props.collection
-                  )}/item/${encodeURIComponent(slug)}`
-                );
-              }
-            }}
-            reason={createResult.reason}
-            onDismiss={props.resetCreateItemState}
-          />
-        )}
-      </DialogContainer>
-      <DialogContainer
-        // ideally this would be a popover on desktop but using a DialogTrigger
-        // wouldn't work since this doesn't open on click but after doing a
-        // network request and it failing and manually wiring about a popover
-        // and modal would be a pain
-        onDismiss={props.resetCreateItemState}
-      >
-        {createResult.kind === 'needs-fork' && isGitHubConfig(config) && (
-          <ForkRepoDialog
-            onCreate={async () => {
-              if (await props.createItem()) {
-                const slug = getSlugFromState(collectionConfig, props.state);
-                router.push(
-                  `${collectionPath}/item/${encodeURIComponent(slug)}`
-                );
-              }
-            }}
-            onDismiss={props.resetCreateItemState}
-            config={config}
-          />
-        )}
-      </DialogContainer>
     </>
   );
 }
